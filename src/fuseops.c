@@ -4,7 +4,7 @@
  * for more details.
  *
  * Copyright (C) 2006-2008 David Collett
- * Copyright (C) 2008-2012 Kristofer Henriksson
+ * Copyright (C) 2008-2012 K. Henriksson
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -74,7 +74,7 @@ void find_original(char* path) {
     char* ext = strrchr(path, '.');
 
     if (ext && strcmp(ext + 1, params.desttype) == 0) {
-        for (size_t i=0; i<sizeof_decoder_list; ++i) {
+        for (size_t i=0; i<decoder_list_len; ++i) {
             strcpy(ext + 1, decoder_list[i]);
             if (access(path, F_OK) == 0) {
                 /* File exists with this extension */
@@ -215,7 +215,6 @@ static int mp3fs_getattr(const char *path, struct stat *stbuf) {
         stbuf->st_size = transcoder_get_size(trans);
         stbuf->st_blocks = (stbuf->st_size + 512 - 1) / 512;
         
-        transcoder_finish(trans);
         transcoder_delete(trans);
     }
     
@@ -319,7 +318,7 @@ passthrough:
 open_fail:
     free(origpath);
 translate_fail:
-    if (read) {
+    if (read >= 0) {
         return (int)read;
     } else {
         return -errno;
@@ -337,9 +336,20 @@ static int mp3fs_statfs(const char *path, struct statvfs *stbuf) {
     if (!origpath) {
         goto translate_fail;
     }
-    
+
+    /* pass-through for regular files */
+    if (statvfs(origpath, stbuf) == 0) {
+        goto passthrough;
+    } else {
+        /* Not really an error. */
+        errno = 0;
+    }
+
+    find_original(origpath);
+
     statvfs(origpath, stbuf);
-    
+
+passthrough:
     free(origpath);
 translate_fail:
     return -errno;
@@ -352,18 +362,10 @@ static int mp3fs_release(const char *path, struct fuse_file_info *fi) {
     
     trans = (struct transcoder*)fi->fh;
     if (trans) {
-        transcoder_finish(trans);
         transcoder_delete(trans);
     }
     
     return 0;
-}
-
-/* We need synchronous reads. */
-static void *mp3fs_init(struct fuse_conn_info *conn) {
-    conn->async_read = 0;
-    
-    return NULL;
 }
 
 struct fuse_operations mp3fs_ops = {
@@ -374,5 +376,4 @@ struct fuse_operations mp3fs_ops = {
     .read     = mp3fs_read,
     .statfs   = mp3fs_statfs,
     .release  = mp3fs_release,
-    .init     = mp3fs_init,
 };

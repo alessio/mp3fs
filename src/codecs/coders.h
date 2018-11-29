@@ -1,7 +1,7 @@
 /*
  * Encoder and decoder interfaces for mp3fs
  *
- * Copyright (C) 2013 Kristofer Henriksson
+ * Copyright (C) 2013 K. Henriksson
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,8 +21,7 @@
 #ifndef CODERS_H
 #define CODERS_H
 
-#include <stdint.h>
-
+#include <cstdint>
 #include <string>
 
 #include "buffer.h"
@@ -68,13 +67,20 @@ public:
                                  const char* description, const uint8_t* data,
                                  int data_length) = 0;
     virtual void set_gain_db(const double dbgain) = 0;
-    virtual int render_tag(Buffer& buffer) = 0;
+    void set_gain(double gainref, double album_gain, double track_gain);
+    virtual int render_tag() = 0;
+    virtual size_t get_actual_size() const = 0;
     virtual size_t calculate_size() const = 0;
     virtual int encode_pcm_data(const int32_t* const data[], int numsamples,
-                                int sample_size, Buffer& buffer) = 0;
-    virtual int encode_finish(Buffer& buffer) = 0;
+                                int sample_size) = 0;
+    virtual int encode_finish() = 0;
 
-    static Encoder* CreateEncoder(const std::string file_type);
+    virtual bool no_partial_encode() { return true; }
+
+    static Encoder* CreateEncoder(const std::string file_type, Buffer& buffer,
+            size_t actual_size = 0);
+
+    constexpr static double invalid_db = 1000.0;
 };
 
 /* Decoder class interface */
@@ -83,8 +89,10 @@ public:
     virtual ~Decoder() { };
 
     virtual int open_file(const char* filename) = 0;
+    /* The modified time of the decoder file */
+    virtual time_t mtime() = 0;
     virtual int process_metadata(Encoder* encoder) = 0;
-    virtual int process_single_fr(Encoder* encoder, Buffer* buffer) = 0;
+    virtual int process_single_fr(Encoder* encoder) = 0;
 
     static Decoder* CreateDecoder(const std::string file_type);
 };

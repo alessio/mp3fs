@@ -1,7 +1,7 @@
 /*
  * mp3 encoder class source for mp3fs
  *
- * Copyright (C) 2013 Kristofer Henriksson
+ * Copyright (C) 2013 K. Henriksson
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,41 +18,30 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#include "mp3_encoder.h"
-
-#include <inttypes.h>
+#include "codecs/mp3_encoder.h"
 
 #include <cmath>
 #include <cstdlib>
 #include <sstream>
 #include <vector>
 
-#include "transcode.h"
+#include "logging.h"
+
+/* Copied from lame */
+#define MAX_VBR_FRAME_SIZE 2880
 
 /* Keep these items in static scope. */
 namespace  {
 
-/*
- * Print messages from lame. We cannot easily prepend a string to indicate
- * that the message comes from lame, so we need to render it ourselves.
- */
-static void lame_print(int priority, const char *fmt, va_list list) {
-    char* msg;
-    if (vasprintf(&msg, fmt, list) != -1) {
-        syslog(priority, "LAME: %s", msg);
-        free(msg);
-    }
-}
-
 /* Callback functions for each type of lame message callback */
 static void lame_error(const char *fmt, va_list list) {
-    lame_print(LOG_ERR, fmt, list);
+    log_with_level(ERROR, "LAME: ", fmt, list);
 }
 static void lame_msg(const char *fmt, va_list list) {
-    lame_print(LOG_INFO, fmt, list);
+    log_with_level(ERROR, "LAME: ", fmt, list);
 }
 static void lame_debug(const char *fmt, va_list list) {
-    lame_print(LOG_DEBUG, fmt, list);
+    log_with_level(DEBUG, "LAME: ", fmt, list);
 }
 
 }
@@ -62,19 +51,27 @@ static void lame_debug(const char *fmt, va_list list) {
  * particular file. Currently error handling is poor. If we run out
  * of memory, these routines will fail silently.
  */
-Mp3Encoder::Mp3Encoder() {
+Mp3Encoder::Mp3Encoder(Buffer& buffer, size_t _actual_size) :
+actual_size(_actual_size), buffer_(buffer) {
     id3tag = id3_tag_new();
 
-    mp3fs_debug("LAME ready to initialize.");
+    Log(DEBUG) << "LAME ready to initialize.";
 
     lame_encoder = lame_init();
 
     set_text_tag(METATAG_ENCODER, PACKAGE_NAME);
 
     /* Set lame parameters. */
-    lame_set_quality(lame_encoder, params.quality);
-    lame_set_brate(lame_encoder, params.bitrate);
-    lame_set_bWriteVbrTag(lame_encoder, 0);
+    if (params.vbr) {
+       lame_set_VBR(lame_encoder, vbr_mt);
+       lame_set_VBR_q(lame_encoder, params.quality);
+       lame_set_VBR_max_bitrate_kbps(lame_encoder, params.bitrate);
+       lame_set_bWriteVbrTag(lame_encoder, 1);
+    } else {
+       lame_set_quality(lame_encoder, params.quality);
+       lame_set_brate(lame_encoder, params.bitrate);
+       lame_set_bWriteVbrTag(lame_encoder, 0);
+    }
     lame_set_errorf(lame_encoder, &lame_error);
     lame_set_msgf(lame_encoder, &lame_msg);
     lame_set_debugf(lame_encoder, &lame_debug);
@@ -85,7 +82,7 @@ Mp3Encoder::Mp3Encoder() {
  * so we have to check ourselves to avoid this case.
  */
 Mp3Encoder::~Mp3Encoder() {
-    if (!id3tag) {
+    if (id3tag) {
         id3_tag_delete(id3tag);
     }
     lame_close(lame_encoder);
@@ -102,15 +99,15 @@ int Mp3Encoder::set_stream_params(uint64_t num_samples, int sample_rate,
     lame_set_in_samplerate(lame_encoder, sample_rate);
     lame_set_num_channels(lame_encoder, channels);
 
-    mp3fs_debug("LAME partially initialized.");
+    Log(DEBUG) << "LAME partially initialized.";
 
     /* Initialise encoder */
     if (lame_init_params(lame_encoder) == -1) {
-        mp3fs_debug("lame_init_params failed.");
+        Log(ERROR) << "lame_init_params failed.";
         return -1;
     }
 
-    mp3fs_debug("LAME initialized.");
+    Log(DEBUG) << "LAME initialized.";
 
     /*
      * Set the length in the ID3 tag, as this is the most convenient place
@@ -220,7 +217,7 @@ void Mp3Encoder::set_picture_tag(const char* mime_type, int type,
  * http://replaygain.hydrogenaudio.org/proposal/player_scale.html
  */
 void Mp3Encoder::set_gain_db(const double dbgain) {
-    mp3fs_debug("LAME setting gain to %f.", dbgain);
+    Log(DEBUG) << "LAME setting gain to " <<  dbgain << ".";
     lame_set_scale(lame_encoder, (float)pow(10.0, dbgain/20));
 }
 
@@ -229,7 +226,7 @@ void Mp3Encoder::set_gain_db(const double dbgain) {
  * thing to go into the Buffer. The ID3v1 tag will also be written 128
  * bytes from the calculated end of the buffer. It has a fixed size.
  */
-int Mp3Encoder::render_tag(Buffer& buffer) {
+int Mp3Encoder::render_tag() {
     /*
      * Disable ID3 compression because it hardly saves space and some
      * players don't like it.
@@ -238,22 +235,29 @@ int Mp3Encoder::render_tag(Buffer& buffer) {
      * Some players = iTunes
      */
     id3_tag_options(id3tag, ID3_TAG_OPTION_COMPRESSION, 0);
-    id3_tag_setlength(id3tag, id3_tag_render(id3tag, 0) + 12);
+    id3_tag_setlength(id3tag, id3_tag_render(id3tag, nullptr) + 12);
 
-    // grow buffer and write v2 tag
-    uint8_t* write_ptr = buffer.write_prepare(id3_tag_render(id3tag, 0));
-    if (!write_ptr) {
-        return -1;
-    }
-    id3size = id3_tag_render(id3tag, write_ptr);
-    buffer.increment_pos(id3size);
+    // write v2 tag
+    id3size = id3_tag_render(id3tag, nullptr);
+    std::vector<uint8_t> tag24(id3size);
+    id3_tag_render(id3tag, tag24.data());
+    buffer_.write(tag24);
 
-    /* Write v1 tag at end of buffer. */
+    // Write v1 tag at end of buffer.
     id3_tag_options(id3tag, ID3_TAG_OPTION_ID3V1, ~0);
-    write_ptr = buffer.write_prepare(128, calculate_size() - 128);
-    id3_tag_render(id3tag, write_ptr);
+    std::vector<uint8_t> tag1(id3v1_tag_length);
+    id3_tag_render(id3tag, tag1.data());
+    buffer_.write(tag1, calculate_size() - id3v1_tag_length);
 
     return 0;
+}
+
+/*
+ * Get the actual number of bytes in the encoded file, i.e. without any
+ * padding. Valid only after encode_finish() has been called.
+ */
+size_t Mp3Encoder::get_actual_size() const {
+    return actual_size;
 }
 
 /*
@@ -263,9 +267,17 @@ int Mp3Encoder::render_tag(Buffer& buffer) {
  * Cast to 64-bit int to avoid overflow.
  */
 size_t Mp3Encoder::calculate_size() const {
-    return id3size + 128
-    + (uint64_t)lame_get_totalframes(lame_encoder)*144*params.bitrate*10
-    / (lame_get_out_samplerate(lame_encoder)/100);
+    if (actual_size != 0) {
+        return actual_size;
+    } else if (params.vbr) {
+        return id3size + id3v1_tag_length + MAX_VBR_FRAME_SIZE
+        + (uint64_t)lame_get_totalframes(lame_encoder)*144*params.bitrate*10
+        / (lame_get_in_samplerate(lame_encoder)/100);
+    } else {
+        return id3size + id3v1_tag_length
+        + (uint64_t)lame_get_totalframes(lame_encoder)*144*params.bitrate*10
+        / (lame_get_out_samplerate(lame_encoder)/100);
+    }
 }
 
 /*
@@ -280,7 +292,7 @@ size_t Mp3Encoder::calculate_size() const {
  * the format used by the FLAC library.
  */
 int Mp3Encoder::encode_pcm_data(const int32_t* const data[], int numsamples,
-                                int sample_size, Buffer& buffer) {
+                                int sample_size) {
     /*
      * We need to properly resample input data to a format LAME wants. LAME
      * requires samples in a C89 sized type, left aligned (i.e. scaled to
@@ -298,19 +310,17 @@ int Mp3Encoder::encode_pcm_data(const int32_t* const data[], int numsamples,
         }
     }
 
-    uint8_t* write_ptr = buffer.write_prepare(5*numsamples/4 + 7200);
-    if (!write_ptr) {
-        return -1;
-    }
+    std::vector<uint8_t> vbuffer(5*numsamples/4 + 7200);
 
     int len = lame_encode_buffer_int(lame_encoder, &lbuf[0], &rbuf[0],
-                                     numsamples, write_ptr,
-                                     5*numsamples/4 + 7200);
+                                     numsamples, vbuffer.data(),
+                                     (int)vbuffer.size());
     if (len < 0) {
         return -1;
     }
+    vbuffer.resize(len);
 
-    buffer.increment_pos(len);
+    buffer_.write(vbuffer);
 
     return 0;
 }
@@ -320,47 +330,53 @@ int Mp3Encoder::encode_pcm_data(const int32_t* const data[], int numsamples,
  * Buffer. This should be called after all input data has already been
  * passed to encode_pcm_data().
  */
-int Mp3Encoder::encode_finish(Buffer& buffer) {
-    uint8_t* write_ptr = buffer.write_prepare(7200);
-    if (!write_ptr) {
-        return -1;
-    }
+int Mp3Encoder::encode_finish() {
+    std::vector<uint8_t> vbuffer(7200);
 
-    int len = lame_encode_flush(lame_encoder, write_ptr, 7200);
+    int len = lame_encode_flush(lame_encoder, vbuffer.data(),
+                                (int)vbuffer.size());
     if (len < 0) {
         return -1;
     }
+    vbuffer.resize(len);
 
-    buffer.increment_pos(len);
+    buffer_.write(vbuffer);
+    actual_size = buffer_.tell() + id3v1_tag_length;
+
+    /*
+     * Write the VBR tag data at id3size bytes after the beginning. lame
+     * already put dummy bytes here when lame_init_params() was called.
+     */
+    if (params.vbr) {
+        std::vector<uint8_t> tail(MAX_VBR_FRAME_SIZE);
+        size_t vbr_tag_size = lame_get_lametag_frame(lame_encoder, tail.data(),
+                MAX_VBR_FRAME_SIZE);
+        if (vbr_tag_size > MAX_VBR_FRAME_SIZE) {
+           return -1;
+        }
+        buffer_.write(tail, id3size);
+    }
 
     return len;
 }
 
 /*
- * This function creates the metadata tag map from the standard values in the
- * enum in coders.h to ID3 values. It will be called only once to set the
- * metatag_map static variable.
+ * This map contains the association from the standard values in the enum in
+ * coders.h to ID3 values.
  */
-const Mp3Encoder::meta_map_t Mp3Encoder::create_meta_map() {
-    meta_map_t m;
-
-    m[METATAG_TITLE] = "TIT2";
-    m[METATAG_ARTIST] = "TPE1";
-    m[METATAG_ALBUM] = "TALB";
-    m[METATAG_GENRE] = "TCON";
-    m[METATAG_DATE] = "TDRC";
-    m[METATAG_COMPOSER] = "TCOM";
-    m[METATAG_PERFORMER] = "TOPE";
-    m[METATAG_COPYRIGHT] = "TCOP";
-    m[METATAG_ENCODEDBY] = "TENC";
-    m[METATAG_ORGANIZATION] = "TPUB";
-    m[METATAG_CONDUCTOR] = "TPE3";
-    m[METATAG_ALBUMARTIST] = "TPE2";
-    m[METATAG_ENCODER] = "TSSE";
-    m[METATAG_TRACKLENGTH] = "TLEN";
-
-    return m;
-}
-
-const Mp3Encoder::meta_map_t Mp3Encoder::metatag_map
-    = Mp3Encoder::create_meta_map();
+const Mp3Encoder::meta_map_t Mp3Encoder::metatag_map {
+    {METATAG_TITLE, "TIT2"},
+    {METATAG_ARTIST, "TPE1"},
+    {METATAG_ALBUM, "TALB"},
+    {METATAG_GENRE, "TCON"},
+    {METATAG_DATE, "TDRC"},
+    {METATAG_COMPOSER, "TCOM"},
+    {METATAG_PERFORMER, "TOPE"},
+    {METATAG_COPYRIGHT, "TCOP"},
+    {METATAG_ENCODEDBY, "TENC"},
+    {METATAG_ORGANIZATION, "TPUB"},
+    {METATAG_CONDUCTOR, "TPE3"},
+    {METATAG_ALBUMARTIST, "TPE2"},
+    {METATAG_ENCODER, "TSSE"},
+    {METATAG_TRACKLENGTH, "TLEN"},
+};

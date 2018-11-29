@@ -1,7 +1,7 @@
 /*
  * data buffer class source for mp3fs
  *
- * Copyright (C) 2013 Kristofer Henriksson
+ * Copyright (C) 2013 K. Henriksson
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -24,120 +24,54 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "transcode.h"
+#include "logging.h"
 
-/* Initially Buffer is empty. It will be allocated as needed. */
-Buffer::Buffer() : buffer_data(0), buffer_pos(0), buffer_size(0) { }
 
-/* If buffer_data was never allocated, this is a no-op. */
-Buffer::~Buffer() {
-    /* Have to work around OS X Mountain Lion bug */
-    int olderrno = errno;
-    free(buffer_data);
-    errno = olderrno;
+void Buffer::write(const std::vector<uint8_t>& data) {
+    ensure_size(buffer_pos_ + data.size());
+    std::copy(data.begin(), data.end(), data_.begin() + buffer_pos_);
+    mark_valid(buffer_pos_, buffer_pos_ + data.size());
+    buffer_pos_ += data.size();
 }
 
-/*
- * Write data to the current position in the Buffer. The position pointer
- * will be updated.
- */
-size_t Buffer::write(const uint8_t* data, size_t length) {
-    uint8_t* write_ptr = write_prepare(length);
-    if (!write_ptr) {
-        return 0;
-    }
-    memcpy(write_ptr, data, length);
-    increment_pos(length);
-
-    return length;
+void Buffer::write(const std::vector<uint8_t>& data, size_t offset) {
+    ensure_size(offset + data.size());
+    std::copy(data.begin(), data.end(), data_.begin() + offset);
+    mark_valid(offset, offset + data.size());
 }
 
-/*
- * Write data to a specified position in the Buffer. The position pointer
- * will not be updated.
- */
-size_t Buffer::write(const uint8_t* data, size_t length, size_t offset) {
-    uint8_t* write_ptr = write_prepare(length, offset);
-    if (!write_ptr) {
-        return 0;
-    }
-    memcpy(write_ptr, data, length);
-
-    return length;
-}
-
-/*
- * Ensure the Buffer has sufficient space for a quantity of data and
- * return a pointer where the data may be written. The position pointer
- * should be updated afterward with increment_pos().
- */
-uint8_t* Buffer::write_prepare(size_t length) {
-    if (reallocate(buffer_pos + length)) {
-        return buffer_data + buffer_pos;
-    } else {
-        return NULL;
+void Buffer::ensure_size(size_t size) {
+    if (data_.size() < size) {
+        if ((size_t)end_bound_ == data_.size()) {
+            end_bound_ = size;
+        }
+        data_.resize(size, 0);
     }
 }
 
-/*
- * Ensure the Buffer has sufficient space for a quantity of data written
- * to a particular location and return a pointer where the data may be
- * written.
- */
-uint8_t* Buffer::write_prepare(size_t length, size_t offset) {
-    if (reallocate(offset + length)) {
-        return buffer_data + offset;
-    } else {
-        return NULL;
-    }
-}
-
-/*
- * Increment the location of the internal pointer. This cannot fail and so
- * returns void. It does not ensure the position is valid memory because
- * that is done by the write_prepare methods via reallocate.
- */
-void Buffer::increment_pos(ptrdiff_t increment) {
-    buffer_pos += increment;
-}
-
-/* Give the value of the internal position pointer. */
-size_t Buffer::tell() const {
-    return buffer_pos;
-}
-
-/* Copy buffered data into output buffer. */
 void Buffer::copy_into(uint8_t* out_data, size_t offset, size_t size) const {
-    memcpy(out_data, buffer_data + offset, size);
+    std::copy(data_.begin() + offset, data_.begin() + offset + size,
+              out_data);
 }
 
-/*
- * Ensure the allocation has at least size bytes available. If not,
- * reallocate memory to make more available. Fill the newly allocated memory
- * with zeroes.
- */
-bool Buffer::reallocate(size_t size) {
-    if (size > buffer_size) {
-        uint8_t* newdata = (uint8_t*)realloc(buffer_data, size);
-        if (!newdata) {
-            return false;
-        }
-        /*
-         * For some reason, errno is set to ENOMEM when the data is moved
-         * as a result of the realloc call. This works around that
-         * behavior.
-         */
-        if (errno == ENOMEM) {
-            errno = 0;
-        }
-        /* Set new allocation to zero. */
-        memset(newdata + buffer_size, 0, size - buffer_size);
+bool Buffer::valid_bytes(size_t offset, size_t size) const {
+    std::streamoff end = offset + size;
 
-        mp3fs_debug("Buffer reallocate: %p -> %p ; %lu -> %lu", buffer_data, newdata, buffer_size, size);
+    return end <= start_bound_ || (std::streamoff)offset >= end_bound_;
+}
 
-        buffer_data = newdata;
-        buffer_size = size;
+void Buffer::mark_valid(std::streamoff start, std::streamoff end) {
+    if (start <= start_bound_) {
+        if (end > start_bound_) {
+            start_bound_ = end;
+        }
+    } else if (end >= end_bound_) {
+        if (start < end_bound_) {
+            end_bound_ = start;
+        }
+    } else {
+        Log(ERROR) << "Cannot mark [" << start << "," << end << ") as valid "
+        "with start_bound=" << start_bound_ << " and end_bound=" << end_bound_;
+        start_bound_ = end;
     }
-
-    return true;
 }

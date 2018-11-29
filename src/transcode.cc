@@ -2,7 +2,7 @@
  * FileTranscoder interface for MP3FS
  *
  * Copyright (C) 2006-2008 David Collett
- * Copyright (C) 2008-2013 Kristofer Henriksson
+ * Copyright (C) 2008-2013 K. Henriksson
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,17 +22,49 @@
 #include "transcode.h"
 
 #include <cerrno>
+#include <cstdarg>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <vector>
 
-#include "coders.h"
+#include "codecs/coders.h"
+#include "logging.h"
+#include "stats_cache.h"
 
 /* Transcoder parameters for open mp3 */
 struct transcoder {
     Buffer buffer;
+    std::string filename;
+    size_t encoded_filesize;
 
     Encoder* encoder;
     Decoder* decoder;
+
+    std::mutex mutex;
 };
+
+namespace {
+
+StatsCache stats_cache;
+
+/*
+ * Transcode the buffer until the buffer has enough or until an error occurs.
+ * The buffer needs at least 'end' bytes before transcoding stops. Returns true
+ * if no errors and false otherwise.
+ */
+bool transcode_until(struct transcoder* trans, size_t end) {
+    while (trans->encoder && trans->buffer.tell() < end) {
+        int stat = trans->decoder->process_single_fr(trans->encoder);
+        if (stat == -1 || (stat == 1 && transcoder_finish(trans) == -1)) {
+            errno = EIO;
+            return false;
+        }
+    }
+    return true;
+}
+
+}
 
 /* Use "C" linkage to allow access from C code. */
 extern "C" {
@@ -40,7 +72,7 @@ extern "C" {
 /* Allocate and initialize the transcoder */
 
 struct transcoder* transcoder_new(char* filename) {
-    mp3fs_debug("Creating transcoder object for %s", filename);
+    Log(DEBUG) << "Creating transcoder object for " << filename;
 
     /* Allocate transcoder structure */
     struct transcoder* trans = new struct transcoder;
@@ -49,48 +81,57 @@ struct transcoder* transcoder_new(char* filename) {
     }
 
     /* Create Encoder and Decoder objects. */
-    trans->encoder = Encoder::CreateEncoder(params.desttype);
+    trans->filename = filename;
+    trans->encoded_filesize = 0;
     trans->decoder = Decoder::CreateDecoder(strrchr(filename, '.') + 1);
-    if (!trans->encoder || !trans->decoder) {
-        goto endecoder_fail;
+    if (!trans->decoder) {
+        goto decoder_fail;
     }
 
-    mp3fs_debug("Ready to initialize decoder.");
+    Log(DEBUG) << "Ready to initialize decoder.";
 
     if (trans->decoder->open_file(filename) == -1) {
         goto init_fail;
     }
 
-    mp3fs_debug("Decoder initialized successfully.");
+    Log(DEBUG) << "Decoder initialized successfully.";
+
+    stats_cache.get_filesize(trans->filename, trans->decoder->mtime(),
+            trans->encoded_filesize);
+    trans->encoder = Encoder::CreateEncoder(params.desttype, trans->buffer,
+            trans->encoded_filesize);
+    if (!trans->encoder) {
+        goto encoder_fail;
+    }
 
     /*
      * Process metadata. The Decoder will call the Encoder to set appropriate
      * tag values for the output file.
      */
     if (trans->decoder->process_metadata(trans->encoder) == -1) {
-        mp3fs_debug("Error processing metadata.");
-        goto init_fail;
+        Log(ERROR) << "Error processing metadata.";
+        goto post_init_fail;
     }
 
-    mp3fs_debug("Metadata processing finished.");
+    Log(DEBUG) << "Metadata processing finished.";
 
     /* Render tag from Encoder to Buffer. */
-    if (trans->encoder->render_tag(trans->buffer) == -1) {
-        mp3fs_debug("Error rendering tag in Encoder.");
-        goto init_fail;
+    if (trans->encoder->render_tag() == -1) {
+        Log(ERROR) << "Error rendering tag in Encoder.";
+        goto post_init_fail;
     }
 
-    mp3fs_debug("Tag written to Buffer.");
+    Log(DEBUG) << "Tag written to Buffer.";
 
     return trans;
 
-init_fail:
-endecoder_fail:
-    delete trans->decoder;
+post_init_fail:
     delete trans->encoder;
-
+encoder_fail:
+init_fail:
+    delete trans->decoder;
+decoder_fail:
     delete trans;
-
 trans_fail:
     return NULL;
 }
@@ -99,54 +140,37 @@ trans_fail:
 
 ssize_t transcoder_read(struct transcoder* trans, char* buff, off_t offset,
                         size_t len) {
-    mp3fs_debug("Reading %zu bytes from offset %jd.", len, (intmax_t)offset);
+    std::lock_guard<std::mutex> l(trans->mutex);
+    Log(DEBUG) << "Reading " << len << " bytes from offset " << offset << ".";
     if ((size_t)offset > transcoder_get_size(trans)) {
-        return 0;
+        return -1;
     }
     if (offset + len > transcoder_get_size(trans)) {
         len = transcoder_get_size(trans) - offset;
     }
 
-    // TODO: Avoid favoring MP3 in program structure.
-    /*
-     * If we are encoding to MP3 and the requested data overlaps the ID3v1 tag
-     * at the end of the file, do not encode data first up to that position.
-     * This optimizes the case where applications read the end of the file
-     * first to read the ID3v1 tag.
-     */
-    if (strcmp(params.desttype, "mp3") == 0 &&
-        (size_t)offset > trans->buffer.tell()
-        && offset + len > (transcoder_get_size(trans) - 128)) {
+    // If the requested data has already been filled into the buffer, simply
+    // copy it out.
+    if (trans->buffer.valid_bytes(offset, len)) {
         trans->buffer.copy_into((uint8_t*)buff, offset, len);
 
         return len;
     }
 
-    if (trans->decoder && trans->encoder) {
-        /* Transcode up to what we need, unless we encounter an error. */
-        while (trans->buffer.tell() < offset + len) {
-            int stat = trans->decoder->process_single_fr(trans->encoder,
-                                                         &trans->buffer);
-            if (stat == -1) {
-                errno = EIO;
-                return 0;
-            } else if (stat == 1) {
-                if (transcoder_finish(trans) == -1) {
-                    errno = EIO;
-                    return 0;
-                }
-                break;
-            }
-        }
+    // If we don't already have the data and we can't produce it, return error.
+    if (!trans->decoder || !trans->encoder) {
+        return -1;
     }
 
-    // truncate if we didnt actually get len
+    if (!transcode_until(trans,
+                         trans->encoder->no_partial_encode() ?
+                         std::numeric_limits<size_t>::max() : offset + len)) {
+        return -1;
+    }
+
+    // truncate if we didn't actually get len
     if (trans->buffer.tell() < offset + len) {
-        if ((size_t)offset < trans->buffer.tell()) {
-            len = trans->buffer.tell() - offset;
-        } else {
-            len = 0;
-        }
+        len = std::max<off_t>(trans->buffer.tell() - offset, 0);
     }
 
     trans->buffer.copy_into((uint8_t*)buff, offset, len);
@@ -158,25 +182,31 @@ ssize_t transcoder_read(struct transcoder* trans, char* buff, off_t offset,
 
 int transcoder_finish(struct transcoder* trans) {
     // flac cleanup
+    time_t decoded_file_mtime = 0;
     if (trans->decoder) {
+        decoded_file_mtime = trans->decoder->mtime();
         delete trans->decoder;
         trans->decoder = NULL;
     }
 
     // lame cleanup
     if (trans->encoder) {
-        int len = trans->encoder->encode_finish(trans->buffer);
-        if (len == -1) {
+        if (trans->encoder->encode_finish() == -1) {
             return -1;
         }
 
         /* Check encoded buffer size. */
-        mp3fs_debug("Finishing file. Predicted size: %zu, final size: %jd",
-                    trans->encoder->calculate_size(),
-                    (intmax_t)(trans->buffer.tell() + 128));
-        trans->buffer.increment_pos(128);
+        trans->encoded_filesize = trans->encoder->get_actual_size();
+        Log(DEBUG) << "Finishing file. Predicted size: " <<
+                trans->encoder->calculate_size() << ", final size: " <<
+                trans->encoded_filesize;
         delete trans->encoder;
         trans->encoder = NULL;
+    }
+
+    if (params.statcachesize > 0 && trans->encoded_filesize != 0) {
+        stats_cache.put_filesize(trans->filename, trans->encoded_filesize,
+                decoded_file_mtime);
     }
 
     return 0;
@@ -185,17 +215,55 @@ int transcoder_finish(struct transcoder* trans) {
 /* Free the transcoder structure. */
 
 void transcoder_delete(struct transcoder* trans) {
-    transcoder_finish(trans);
+    if (trans->decoder) {
+        delete trans->decoder;
+    }
+    if (trans->encoder) {
+        delete trans->encoder;
+    }
     delete trans;
 }
 
 /* Return size of output file, as computed by Encoder. */
 size_t transcoder_get_size(struct transcoder* trans) {
-    if (trans->encoder) {
+    if (trans->encoded_filesize != 0) {
+        return trans->encoded_filesize;
+    } else if (trans->encoder) {
         return trans->encoder->calculate_size();
     } else {
         return trans->buffer.tell();
     }
+}
+
+void mp3fs_debug(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    log_with_level(DEBUG, format, args);
+    va_end(args);
+}
+
+void mp3fs_error(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    log_with_level(ERROR, format, args);
+    va_end(args);
+}
+
+int init_logging(const char* logfile, const char* max_level, int to_stderr,
+                 int to_syslog) {
+    static const std::map<std::string, Logging::level> level_map = {
+        {"DEBUG", DEBUG},
+        {"INFO", INFO},
+        {"ERROR", ERROR},
+    };
+    auto it = level_map.find(max_level);
+
+    if (it == level_map.end()) {
+        fprintf(stderr, "Invalid logging level string: %s\n", max_level);
+        return false;
+    }
+
+    return InitLogging(logfile, it->second, to_stderr, to_syslog);
 }
 
 }

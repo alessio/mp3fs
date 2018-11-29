@@ -1,7 +1,7 @@
 /*
  * FLAC decoder class header for mp3fs
  *
- * Copyright (C) 2013 Kristofer Henriksson
+ * Copyright (C) 2013 K. Henriksson
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,19 +21,25 @@
 #ifndef FLAC_DECODER_H
 #define FLAC_DECODER_H
 
-#include "coders.h"
-
 #include <map>
 #include <string>
 
+// The pragmas suppress the named warning from FLAC++, on both GCC and clang.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Woverloaded-virtual"
 #include <FLAC++/decoder.h>
 #include <FLAC++/metadata.h>
+#pragma GCC diagnostic pop
+
+#include "codecs/coders.h"
 
 class FlacDecoder : public Decoder, private FLAC::Decoder::File {
 public:
+    FlacDecoder() : has_streaminfo(false) {};
     int open_file(const char* filename);
+    time_t mtime();
     int process_metadata(Encoder* encoder);
-    int process_single_fr(Encoder* encoder, Buffer* buffer);
+    int process_single_fr(Encoder* encoder);
 protected:
     FLAC__StreamDecoderWriteStatus write_callback(const FLAC__Frame* frame,
                                                   const FLAC__int32* const buffer[]);
@@ -41,10 +47,10 @@ protected:
     void error_callback(FLAC__StreamDecoderErrorStatus status);
 private:
     Encoder* encoder_c;
-    Buffer* buffer_c;
+    time_t mtime_;
     FLAC::Metadata::StreamInfo info;
+    bool has_streaminfo;
     typedef std::map<std::string,int> meta_map_t;
-    static const meta_map_t create_meta_map();
     static const meta_map_t metatag_map;
 };
 
